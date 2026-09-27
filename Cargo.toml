@@ -1,0 +1,37 @@
+[package]
+name = "duckplus"
+version = "0.1.0"
+edition = "2024"
+description = "A lightning-fast native IDE for DuckDB over the Quack protocol"
+license = "MIT"
+repository = "https://github.com/wes/duckplus"
+readme = "README.md"
+keywords = ["duckdb", "database", "gui", "gpui", "quack"]
+categories = ["development-tools", "gui"]
+
+[dependencies]
+gpui-kit = { version = "0.6", features = ["tree-sitter-sql"] }
+duckdb = { version = "1.10505", features = ["bundled"] }
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+futures = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sqlformat = "0.5.0"
+lsp-types = "0.97"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[profile.dev.package."*"]
+# Keep dependencies fast in debug builds; our own crate stays debuggable.
+opt-level = 2
+
+[dev-dependencies]
+gpui-kit = { version = "0.6", features = ["tree-sitter-sql", "test-support"] }
