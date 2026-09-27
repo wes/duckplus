@@ -6,7 +6,7 @@ Built in Rust on [GPUI](https://gpui-kit.com) (the GPU-accelerated UI framework 
 
 ## Download
 
-Get the latest **DuckPlus.dmg** from [Releases](https://github.com/wes/duckplus/releases/latest), open it, and drag DuckPlus into Applications. It's a universal app (Apple Silicon and Intel), signed and notarized by Apple, and needs macOS 12 or later.
+Get the latest **DuckPlus-&lt;version&gt;.dmg** from [Releases](https://github.com/wes/duckplus/releases/latest), open it, and drag DuckPlus into Applications. It's a universal app (Apple Silicon and Intel), signed and notarized by Apple, and needs macOS 12 or later.
 
 ## Features
 

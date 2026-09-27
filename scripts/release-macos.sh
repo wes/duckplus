@@ -70,5 +70,5 @@ if [[ "$NOTARIZE" == 1 ]]; then
   spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
 fi
 
-shasum -a 256 "$DMG" | tee "$DMG.sha256"
+(cd "$(dirname "$DMG")" && shasum -a 256 "$(basename "$DMG")" | tee "$(basename "$DMG").sha256")
 echo "==> Done: $DMG ($(du -h "$DMG" | cut -f1))"
