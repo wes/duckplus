@@ -8,7 +8,7 @@ Built in Rust on [GPUI](https://gpui-kit.com) (the GPU-accelerated UI framework 
 
 ## Download
 
-Get the latest **DuckPlus-&lt;version&gt;.dmg** from [Releases](https://github.com/wes/duckplus/releases/latest), open it, and drag DuckPlus into Applications. It's a universal app (Apple Silicon and Intel), signed and notarized by Apple, and needs macOS 12 or later.
+**[Download DuckPlus for Mac](https://github.com/wes/duckplus/releases/latest/download/DuckPlus.dmg)** (always the latest release), open it, and drag DuckPlus into Applications. Older versions are on the [Releases](https://github.com/wes/duckplus/releases) page. It's a universal app (Apple Silicon and Intel), signed and notarized by Apple, and needs macOS 12 or later.
 
 ## Features
 
@@ -115,7 +115,7 @@ It needs a *Developer ID Application* certificate in your keychain and notarizat
 xcrun notarytool store-credentials duckplus-notary --apple-id you@example.com --team-id TEAMID
 ```
 
-Bump `version` in `Cargo.toml`, run the script, then attach `target/bundle/DuckPlus-<version>.dmg` to a GitHub release.
+Bump `version` in `Cargo.toml` and run `scripts/release-macos.sh --publish`. That creates the `v<version>` GitHub release, marked Latest, with both `DuckPlus-<version>.dmg` and `DuckPlus.dmg`. The unversioned name keeps `releases/latest/download/DuckPlus.dmg` pointing at the newest build.
 
 ## License
 

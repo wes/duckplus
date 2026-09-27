@@ -3,6 +3,11 @@
 #
 #   scripts/release-macos.sh                  # build, sign, notarize, staple
 #   scripts/release-macos.sh --skip-notarize  # build and sign only
+#   scripts/release-macos.sh --publish        # …then create the GitHub release (as Latest)
+#
+# Besides DuckPlus-<version>.dmg it writes DuckPlus.dmg, the same file under a
+# fixed name, so this link always serves the newest release:
+#   https://github.com/wes/duckplus/releases/latest/download/DuckPlus.dmg
 #
 # Needs a "Developer ID Application" certificate in the keychain, and (for
 # notarization) credentials saved once with:
@@ -18,9 +23,11 @@ cd "$(dirname "$0")/.."
 [[ "$(uname)" == "Darwin" ]] || { echo "release-macos.sh needs macOS"; exit 1; }
 
 NOTARIZE=1
+PUBLISH=0
 for arg in "$@"; do
   case "$arg" in
     --skip-notarize) NOTARIZE=0 ;;
+    --publish) PUBLISH=1 ;;
     *) echo "unknown option: $arg"; exit 1 ;;
   esac
 done
@@ -70,5 +77,15 @@ if [[ "$NOTARIZE" == 1 ]]; then
   spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
 fi
 
-(cd "$(dirname "$DMG")" && shasum -a 256 "$(basename "$DMG")" | tee "$(basename "$DMG").sha256")
+cp "$DMG" target/bundle/DuckPlus.dmg
+(cd target/bundle && for f in "DuckPlus-${VERSION}.dmg" DuckPlus.dmg; do
+  shasum -a 256 "$f" | tee "$f.sha256"
+done)
 echo "==> Done: $DMG ($(du -h "$DMG" | cut -f1))"
+
+if [[ "$PUBLISH" == 1 ]]; then
+  [[ "$NOTARIZE" == 1 ]] || { echo "Refusing to publish a build that wasn't notarized"; exit 1; }
+  echo "==> Publishing GitHub release v${VERSION}…"
+  gh release create "v${VERSION}" --title "DuckPlus ${VERSION}" --generate-notes --latest \
+    "$DMG" "$DMG.sha256" target/bundle/DuckPlus.dmg target/bundle/DuckPlus.dmg.sha256
+fi
