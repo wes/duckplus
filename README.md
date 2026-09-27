@@ -4,6 +4,8 @@ A lightning-fast, native DuckDB IDE that speaks the [Quack](https://duckdb.org/q
 
 Built in Rust on [GPUI](https://gpui-kit.com) (the GPU-accelerated UI framework behind Zed), so it's a real native app. There's no Electron and no web view.
 
+![DuckPlus: schema browser, SQL editor and results grid](docs/screenshots/workspace.png)
+
 ## Download
 
 Get the latest **DuckPlus-&lt;version&gt;.dmg** from [Releases](https://github.com/wes/duckplus/releases/latest), open it, and drag DuckPlus into Applications. It's a universal app (Apple Silicon and Intel), signed and notarized by Apple, and needs macOS 12 or later.
@@ -21,6 +23,17 @@ Get the latest **DuckPlus-&lt;version&gt;.dmg** from [Releases](https://github.c
 - **CSV import.** Drop CSV files anywhere on a workspace, or pick them from the sidebar. Name each table, then watch them load side by side with a progress bar per file.
 - **Guardrails.** `DROP`, `DELETE`, and `TRUNCATE` need a second ⌘↵. There's a configurable row limit, a live query timer, and Cancel (⌘.).
 - **JetBrains Mono built in** for the editor, the grid, and table names, so it looks the same on every machine. Light and dark themes follow the OS or can be pinned in Settings.
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/autocomplete.png" alt="Schema-aware autocomplete listing a table's columns with their types"></td>
+    <td><img src="docs/screenshots/csv-import.png" alt="Importing two CSV files, each named as a new table"></td>
+  </tr>
+  <tr>
+    <td align="center">Autocomplete knows your tables, columns and aliases</td>
+    <td align="center">Drop CSV files on the window to import them</td>
+  </tr>
+</table>
 
 ## How it talks to DuckDB
 
