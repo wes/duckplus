@@ -37,17 +37,20 @@ Built in Rust on [GPUI](https://gpui-kit.com) (the GPU-accelerated UI framework 
 
 ## How it talks to DuckDB
 
-DuckPlus embeds an in-memory DuckDB whose only job is to speak Quack. Every statement is shipped to the server with:
+DuckPlus embeds an in-memory DuckDB whose only job is to speak Quack. It attaches the server once, then ships every statement over that session:
 
 ```sql
-SELECT * FROM quack_query('quack:host:port', '<your sql>', token := '…')
+ATTACH 'quack:host:port' AS session (TOKEN '…');
+SELECT * FROM quack_query_by_name('session', '<your sql>');
 ```
 
-So you get the server's full SQL dialect (DDL and multiple statements included), and results arrive in DuckDB's native vector format. Schema lookups run on a separate connection, so they never wait behind a long query.
+So you get the server's full SQL dialect (DDL and multiple statements included), and results arrive in DuckDB's native vector format. Each statement is a single HTTP request. A stateless `quack_query(...)` takes three (open, run, close), each on a fresh HTTPS connection, so on a server 40 ms away the session saves about 400 ms per query.
+
+The session behaves like any database connection: temp tables, `SET` and `USE` carry over between runs. Schema lookups use a second session, so they never wait behind a long query.
 
 Endpoints use `quack:host[:port]` (default port 9494). `localhost` uses plain HTTP and other hosts default to HTTPS. Turn on **Plain HTTP** for servers on a private network.
 
-> Quack is in beta (stable is planned for DuckDB 2.0). `ATTACH 'quack:…'` has catalog gaps today, which is why DuckPlus uses `quack_query`. Quack also has no remote cancel yet. Cancel frees the UI at once, but the server finishes the abandoned statement in the background.
+> Quack is in beta (stable is planned for DuckDB 2.0). Reading attached tables directly (`FROM session.schema.table`) has catalog gaps today, which is why the SQL runs on the server through `quack_query_by_name`. Quack also has no remote cancel yet. Cancel frees the UI at once and moves your next query to a fresh session, while the server finishes the abandoned statement in the background.
 
 ## Try it
 

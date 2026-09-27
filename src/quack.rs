@@ -1,9 +1,11 @@
 //! Database client: a remote Quack server or a local DuckDB file.
 //!
 //! For Quack, DuckPlus embeds an in-memory DuckDB whose only job is to speak
-//! the protocol. Every statement is shipped to the server through
-//! `quack_query(endpoint, sql, token := ...)`, so the full remote dialect is
-//! available. Local files are opened directly by the embedded engine.
+//! the protocol. It ATTACHes the server once per lane (see [`Lane`]) and ships
+//! every statement through `quack_query_by_name(session, sql)`, so the full
+//! remote dialect is available. That's one HTTP request per statement, where a
+//! stateless `quack_query(endpoint, sql, token := ...)` costs three (open, run,
+//! close), each on a fresh HTTPS connection. Local files are opened directly by the embedded engine.
 //! Either way results arrive as Arrow batches, formatted lazily — only the
 //! cells on screen are ever turned into strings.
 
@@ -64,6 +66,65 @@ struct Remote {
     endpoint: String,
     token: String,
     tls: TlsMode,
+    /// Server sessions this handle runs SQL on, one per [`Lane`].
+    query: Mutex<Session>,
+    meta: Mutex<Session>,
+    /// Cleared when ATTACH fails but a stateless call works; from then on
+    /// every call goes through `quack_query`.
+    attach_ok: AtomicBool,
+    /// The server's default database, fetched when a lane has to leave a
+    /// database it `USE`d.
+    default_db: Mutex<Option<String>>,
+}
+
+impl Remote {
+    fn new(endpoint: &str, token: &str, tls: TlsMode) -> Self {
+        Self {
+            endpoint: normalize_endpoint(endpoint),
+            token: token.to_string(),
+            tls,
+            query: Mutex::default(),
+            meta: Mutex::default(),
+            attach_ok: AtomicBool::new(true),
+            default_db: Mutex::default(),
+        }
+    }
+
+    /// `ATTACH` for this server under `alias`.
+    fn attach_sql(&self, alias: &str) -> String {
+        let mut sql = format!(
+            "ATTACH {} AS {} (TOKEN {}",
+            sql_literal(&self.endpoint),
+            quote_ident(alias),
+            sql_literal(&self.token)
+        );
+        if self.tls == TlsMode::Disabled {
+            sql.push_str(", DISABLE_SSL true");
+        }
+        sql.push(')');
+        sql
+    }
+}
+
+/// Which server session a call runs on. User queries and schema lookups get
+/// separate sessions so neither waits behind the other.
+#[derive(Clone, Copy, PartialEq)]
+enum Lane {
+    Query,
+    Meta,
+}
+
+/// One attached server session. Its state sticks between calls (temp tables,
+/// `SET`, `USE`), like any database client's connection.
+#[derive(Default)]
+struct Session {
+    /// Name it's attached under; `None` until first use, or after it was
+    /// abandoned or lost.
+    alias: Option<String>,
+    /// We sent a `USE` on it, so "no database" means switching back.
+    switched: bool,
+    /// A call is in flight on it.
+    busy: bool,
 }
 
 /// Local databases already open in this process, so a second window (or a
@@ -100,17 +161,14 @@ impl QuackClient {
         let meta = conn.try_clone()?;
         let client = Self {
             inner: Arc::new(Inner {
-                remote: Some(Remote {
-                    endpoint: normalize_endpoint(endpoint),
-                    token: token.to_string(),
-                    tls,
-                }),
+                remote: Some(Remote::new(endpoint, token, tls)),
                 base: Mutex::new(conn),
                 meta: Mutex::new(meta),
                 running: Mutex::new(None),
             }),
         };
         let info = client.ping()?;
+        client.warm_query_lane();
         Ok((client, info))
     }
 
@@ -161,16 +219,187 @@ impl QuackClient {
         let meta = base.try_clone()?;
         Ok(Self {
             inner: Arc::new(Inner {
-                remote: self.inner.remote.as_ref().map(|r| Remote {
-                    endpoint: r.endpoint.clone(),
-                    token: r.token.clone(),
-                    tls: r.tls,
+                remote: self.inner.remote.as_ref().map(|r| {
+                    let fresh = Remote::new(&r.endpoint, &r.token, r.tls);
+                    fresh.attach_ok.store(r.attach_ok.load(Relaxed), Relaxed);
+                    fresh
                 }),
                 base: Mutex::new(base),
                 meta: Mutex::new(meta),
                 running: Mutex::new(None),
             }),
         })
+        .inspect(Self::warm_query_lane)
+    }
+
+    /// Attach the query session in the background, so the first query
+    /// doesn't pay for it.
+    fn warm_query_lane(&self) {
+        if self.is_local() {
+            return;
+        }
+        let client = self.clone();
+        std::thread::spawn(move || {
+            let remote = client.inner.remote.as_ref().unwrap();
+            if remote.attach_ok.load(Relaxed) && remote.query.lock().unwrap().alias.is_none() {
+                if let Ok(alias) = client.attach(remote) {
+                    client.adopt(&remote.query, alias);
+                }
+            }
+        });
+    }
+
+    /// Attach a new server session and return its alias.
+    fn attach(&self, remote: &Remote) -> Result<String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let alias = format!("quack_session_{}", NEXT.fetch_add(1, Relaxed));
+        let conn = self.inner.base.lock().unwrap().try_clone()?;
+        conn.execute_batch(&remote.attach_sql(&alias))
+            .map_err(|e| self.clean_error(e))?;
+        Ok(alias)
+    }
+
+    /// Make `alias` the lane's session, unless another thread got there
+    /// first (then it's closed). Sessions are attached outside the lock so a
+    /// slow ATTACH never blocks `cancel` on the UI thread.
+    fn adopt(&self, slot: &Mutex<Session>, alias: String) {
+        let mut session = slot.lock().unwrap();
+        if session.alias.is_none() {
+            *session = Session { alias: Some(alias), ..Default::default() };
+        } else {
+            drop(session);
+            self.detach(&alias);
+        }
+    }
+
+    /// Close a server session (best effort).
+    fn detach(&self, alias: &str) {
+        if let Ok(conn) = self.inner.base.lock().unwrap().try_clone() {
+            let _ = conn.execute_batch(&format!("DETACH {}", quote_ident(alias)));
+        }
+    }
+
+    /// Ship `sql` to the server on `lane`'s session and hand `run` the local
+    /// SQL that does it. `database` (query lane) is `USE`d first; `None`
+    /// switches back to the server's default if an earlier call left it.
+    /// A session the server has forgotten is replaced and the call retried
+    /// once (the server rejects those before running anything).
+    fn remote_call<T>(
+        &self,
+        lane: Lane,
+        sql: &str,
+        database: Option<&str>,
+        run: impl Fn(&str) -> duckdb::Result<T>,
+    ) -> Result<T> {
+        let remote = self.inner.remote.as_ref().expect("remote client");
+        let stateless = |sql: &str| {
+            let script = match database {
+                Some(db) => format!("USE {};\n{sql}", quote_ident(db)),
+                None => sql.to_string(),
+            };
+            run(&self.wrap(&script)).map_err(|e| self.clean_error(e))
+        };
+        if !remote.attach_ok.load(Relaxed) {
+            return stateless(sql);
+        }
+        let back_to = match (database, lane) {
+            (None, Lane::Query) if remote.query.lock().unwrap().switched => {
+                Some(self.default_database(remote)?)
+            }
+            _ => None,
+        };
+        let slot = match lane {
+            Lane::Query => &remote.query,
+            Lane::Meta => &remote.meta,
+        };
+        let mut retried = false;
+        loop {
+            let needs_session = {
+                let mut session = slot.lock().unwrap();
+                if session.busy && lane == Lane::Query {
+                    // Still running an abandoned query: start a fresh session
+                    // rather than queue behind it. Its runner detaches it.
+                    *session = Session::default();
+                }
+                session.alias.is_none()
+            };
+            if needs_session {
+                match self.attach(remote) {
+                    Ok(alias) => self.adopt(slot, alias),
+                    Err(e) => {
+                        // ATTACH can't reach this server: if a stateless call
+                        // can, use that from now on.
+                        let result = stateless(sql);
+                        if result.is_ok() {
+                            remote.attach_ok.store(false, Relaxed);
+                            return result;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            let (alias, script) = {
+                let mut session = slot.lock().unwrap();
+                let Some(alias) = session.alias.clone() else {
+                    continue; // cancelled while attaching; try again
+                };
+                let script = match (database, &back_to) {
+                    (Some(db), _) => {
+                        session.switched = true;
+                        format!("USE {};\n{sql}", quote_ident(db))
+                    }
+                    (None, Some(db)) if session.switched => {
+                        session.switched = false;
+                        format!("USE {};\n{sql}", quote_ident(db))
+                    }
+                    _ => sql.to_string(),
+                };
+                session.busy = true;
+                (alias, script)
+            };
+            let result = run(&format!(
+                "SELECT * FROM quack_query_by_name({}, {})",
+                sql_literal(&alias),
+                sql_literal(&script)
+            ));
+            let lost = matches!(&result, Err(e) if e.to_string().contains("Invalid connection id"));
+            let orphaned = {
+                let mut session = slot.lock().unwrap();
+                if session.alias.as_deref() == Some(alias.as_str()) {
+                    session.busy = false;
+                    if lost {
+                        *session = Session::default();
+                    }
+                    lost
+                } else {
+                    true
+                }
+            };
+            if orphaned {
+                self.detach(&alias);
+            }
+            if lost && !retried {
+                retried = true;
+                continue;
+            }
+            return result.map_err(|e| self.clean_error(e));
+        }
+    }
+
+    /// The server's default database (what "All databases" queries run in).
+    fn default_database(&self, remote: &Remote) -> Result<String> {
+        if let Some(db) = remote.default_db.lock().unwrap().clone() {
+            return Ok(db);
+        }
+        // The meta lane never `USE`s, so it's still on the default.
+        let db = self
+            .meta_rows("SELECT current_database()")?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next().flatten())
+            .ok_or_else(|| anyhow!("couldn't find the default database"))?;
+        *remote.default_db.lock().unwrap() = Some(db.clone());
+        Ok(db)
     }
 
     pub fn ping(&self) -> Result<ServerInfo> {
@@ -210,61 +439,25 @@ impl QuackClient {
         let started = Instant::now();
         let conn = self.inner.base.lock().unwrap().try_clone()?;
         *self.inner.running.lock().unwrap() = Some(conn.interrupt_handle());
-        let scoped;
-        let sql = match database {
-            // Every query runs on a fresh connection (and Quack calls are
-            // stateless), so the USE has to travel with each one.
-            Some(db) if self.is_local() => {
+        let (schema, batches, offsets, total, truncated) = if self.is_local() {
+            // Every local query runs on a fresh connection, so the USE has
+            // to come with it.
+            if let Some(db) = database {
                 conn.execute_batch(&format!("USE {}", quote_ident(db)))
                     .map_err(|e| self.clean_error(e))?;
-                sql
             }
-            Some(db) => {
-                scoped = format!("USE {};\n{sql}", quote_ident(db));
-                &scoped
-            }
-            None => sql,
-        };
-        let wrapped = if self.is_local() {
-            // quack_query takes whole scripts; locally only one statement can
-            // be prepared, so run the leading ones first and show the last.
+            // Only one statement can be prepared locally, so run the leading
+            // ones first and show the last.
             let mut statements = split_statements(sql);
             let last = statements.pop().unwrap_or_else(|| sql.to_string());
             if !statements.is_empty() {
                 conn.execute_batch(&statements.join(";\n"))
                     .map_err(|e| self.clean_error(e))?;
             }
-            last
+            collect_arrow(&conn, &last, max_rows).map_err(|e| self.clean_error(e))?
         } else {
-            self.wrap(sql)
+            self.remote_call(Lane::Query, sql, database, |q| collect_arrow(&conn, q, max_rows))?
         };
-        let mut stmt = conn.prepare(&wrapped).map_err(|e| self.clean_error(e))?;
-        let arrow = stmt.query_arrow([]).map_err(|e| self.clean_error(e))?;
-        let schema = arrow.get_schema();
-        let mut batches = Vec::new();
-        let mut offsets = Vec::new();
-        let mut total = 0usize;
-        let mut truncated = false;
-        for batch in arrow {
-            if total >= max_rows {
-                truncated = true;
-                break;
-            }
-            let take = (max_rows - total).min(batch.num_rows());
-            let batch = if take < batch.num_rows() {
-                truncated = true;
-                batch.slice(0, take)
-            } else {
-                batch
-            };
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let batch = normalize_batch(batch);
-            offsets.push(total);
-            total += batch.num_rows();
-            batches.push(batch);
-        }
         let columns = schema
             .fields()
             .iter()
@@ -290,24 +483,38 @@ impl QuackClient {
         if let Some(handle) = self.inner.running.lock().unwrap().take() {
             handle.interrupt();
         }
+        // The server keeps running it, so the next query gets a new session
+        // instead of waiting; the abandoned one is closed when it finishes.
+        if let Some(remote) = &self.inner.remote {
+            let mut session = remote.query.lock().unwrap();
+            if session.busy {
+                *session = Session::default();
+            }
+        }
     }
 
     /// Small helper for metadata lookups: everything comes back as strings.
     pub fn meta_rows(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
-        let wrapped = format!("SELECT COLUMNS(*)::VARCHAR FROM ({})", self.wrap(sql));
         let conn = self.inner.meta.lock().unwrap();
-        let mut stmt = conn.prepare(&wrapped).map_err(|e| self.clean_error(e))?;
-        let mut rows = stmt.query([]).map_err(|e| self.clean_error(e))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let ncols = row.as_ref().column_count();
-            let mut r = Vec::with_capacity(ncols);
-            for i in 0..ncols {
-                r.push(row.get::<_, Option<String>>(i)?);
+        let read = |q: &str| -> duckdb::Result<Vec<Vec<Option<String>>>> {
+            let mut stmt = conn.prepare(&format!("SELECT COLUMNS(*)::VARCHAR FROM ({q})"))?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let ncols = row.as_ref().column_count();
+                let mut r = Vec::with_capacity(ncols);
+                for i in 0..ncols {
+                    r.push(row.get::<_, Option<String>>(i)?);
+                }
+                out.push(r);
             }
-            out.push(r);
+            Ok(out)
+        };
+        if self.is_local() {
+            read(sql).map_err(|e| self.clean_error(e))
+        } else {
+            self.remote_call(Lane::Meta, sql, None, read)
         }
-        Ok(out)
     }
 
     /// The table's best declared row key: its primary key, else its first
@@ -346,9 +553,9 @@ impl QuackClient {
 
     /// Run statements in one transaction: all of them apply, or none do.
     pub fn execute_transaction(&self, statements: &[String]) -> Result<()> {
-        let conn = self.inner.base.lock().unwrap().try_clone()?;
         let body = statements.join(";\n");
         if self.is_local() {
+            let conn = self.inner.base.lock().unwrap().try_clone()?;
             conn.execute_batch("BEGIN TRANSACTION")?;
             if let Err(e) = conn.execute_batch(&body) {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -357,16 +564,16 @@ impl QuackClient {
             conn.execute_batch("COMMIT")
                 .map_err(|e| self.clean_error(e))
         } else {
+            // On the meta lane, whose calls take turns (its connection is
+            // locked for each), so it never overlaps a schema lookup.
+            let conn = self.inner.meta.lock().unwrap();
+            let exec = |q: &str| conn.prepare(q).and_then(|mut stmt| stmt.query([]).map(|_| ()));
             let script = format!("BEGIN TRANSACTION;\n{body};\nCOMMIT;");
-            let result = conn
-                .prepare(&self.wrap(&script))
-                .and_then(|mut stmt| stmt.query([]).map(|_| ()))
-                .map_err(|e| self.clean_error(e));
+            let result = self.remote_call(Lane::Meta, &script, None, exec);
             if result.is_err() {
-                // In case the server kept the failed transaction open.
-                let _ = conn
-                    .prepare(&self.wrap("ROLLBACK"))
-                    .and_then(|mut stmt| stmt.query([]).map(|_| ()));
+                // The session outlives the call, so don't leave a failed
+                // transaction open on it.
+                let _ = self.remote_call(Lane::Meta, "ROLLBACK", None, exec);
             }
             result
         }
@@ -421,16 +628,8 @@ impl QuackClient {
             Some(remote) => {
                 // Quack only reaches the server's default database this way.
                 let conn = Connection::open_in_memory()?;
-                let mut attach = format!(
-                    "LOAD quack; ATTACH {} AS remote (TOKEN {}",
-                    sql_literal(&remote.endpoint),
-                    sql_literal(&remote.token)
-                );
-                if remote.tls == TlsMode::Disabled {
-                    attach.push_str(", DISABLE_SSL true");
-                }
-                attach.push(')');
-                conn.execute_batch(&attach).map_err(|e| self.clean_error(e))?;
+                conn.execute_batch(&format!("LOAD quack; {}", remote.attach_sql("remote")))
+                    .map_err(|e| self.clean_error(e))?;
                 if database.eq_ignore_ascii_case(&default_db) {
                     let dest = format!(
                         "remote.{}.{}",
@@ -482,8 +681,11 @@ impl QuackClient {
                 bail!("Cancelled");
             }
             if let Some(script) = &finish {
-                conn.prepare(&self.wrap(script))
-                    .and_then(|mut stmt| stmt.query([]).map(|_| ()))
+                conn.prepare(&format!(
+                    "SELECT * FROM quack_query_by_name('remote', {})",
+                    sql_literal(script)
+                ))
+                .and_then(|mut stmt| stmt.query([]).map(|_| ()))
                     .map_err(|e| self.clean_error(e))?;
             }
             Ok(())
@@ -641,6 +843,47 @@ impl QuackClient {
         }
         clean_quack_error(e)
     }
+}
+
+type Collected = (
+    Arc<Schema>,
+    Vec<RecordBatch>,
+    Vec<usize>,
+    usize,
+    bool,
+);
+
+/// Run `sql` and keep up to `max_rows` rows as Arrow batches: (schema,
+/// batches, each batch's first row, row count, whether rows were left over).
+fn collect_arrow(conn: &Connection, sql: &str, max_rows: usize) -> duckdb::Result<Collected> {
+    let mut stmt = conn.prepare(sql)?;
+    let arrow = stmt.query_arrow([])?;
+    let schema = arrow.get_schema();
+    let mut batches = Vec::new();
+    let mut offsets = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    for batch in arrow {
+        if total >= max_rows {
+            truncated = true;
+            break;
+        }
+        let take = (max_rows - total).min(batch.num_rows());
+        let batch = if take < batch.num_rows() {
+            truncated = true;
+            batch.slice(0, take)
+        } else {
+            batch
+        };
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let batch = normalize_batch(batch);
+        offsets.push(total);
+        total += batch.num_rows();
+        batches.push(batch);
+    }
+    Ok((schema, batches, offsets, total, truncated))
 }
 
 /// Split a script into statements on `;`, ignoring semicolons inside quotes,
@@ -1391,5 +1634,91 @@ mod quack_import_tests {
             count(&format!("SELECT count(*) FROM duckdb_tables() WHERE table_name = '{c}'")),
             "0"
         );
+    }
+}
+
+/// Session behavior against a live server:
+/// DUCKPLUS_QUACK=quack:localhost:9598 DUCKPLUS_TOKEN=… cargo test quack_sessions -- --ignored --nocapture
+#[cfg(test)]
+mod quack_session_tests {
+    use super::{QuackClient, TlsMode};
+    use std::time::{Duration, Instant};
+
+    fn client() -> QuackClient {
+        let endpoint = std::env::var("DUCKPLUS_QUACK").unwrap();
+        let token = std::env::var("DUCKPLUS_TOKEN").unwrap();
+        QuackClient::connect(&endpoint, &token, TlsMode::Auto).unwrap().0
+    }
+
+    fn one(client: &QuackClient, sql: &str, db: Option<&str>) -> String {
+        let r = client.run(sql, 10, db).unwrap();
+        r.cell(0, 0).unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore]
+    fn quack_sessions() {
+        let client = client();
+        std::thread::sleep(Duration::from_millis(300)); // let the query lane warm up
+
+        // State sticks between runs, like a normal connection.
+        one(&client, "CREATE OR REPLACE TEMP TABLE t AS SELECT 42 AS x; SELECT 1", None);
+        assert_eq!(one(&client, "SELECT x FROM t", None), "42");
+
+        // USE follows the database picker, and "All databases" goes back.
+        let default = one(&client, "SELECT current_database()", None);
+        one(&client, "ATTACH IF NOT EXISTS ':memory:' AS side; SELECT 1", None);
+        assert_eq!(one(&client, "SELECT current_database()", Some("side")), "side");
+        assert_eq!(one(&client, "SELECT current_database()", None), default);
+
+        // Schema lookups don't wait behind a long query.
+        let slow = {
+            let c = client.clone();
+            std::thread::spawn(move || c.run("SELECT count(*) FROM range(2000000000) t(i) WHERE i % 7 = 3", 1, None))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        client.meta_rows("SELECT 1").unwrap();
+        println!("meta during long query: {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_millis(500));
+
+        // Cancel frees the next query even though the server keeps going.
+        client.cancel();
+        let t = Instant::now();
+        assert_eq!(one(&client, "SELECT 7", None), "7");
+        println!("query right after cancel: {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(1));
+        let _ = slow.join();
+
+        // Transactions roll back cleanly and leave the session usable.
+        one(&client, "CREATE OR REPLACE TABLE side.main.acct AS SELECT 1 AS id, 10 AS bal", None);
+        assert!(client
+            .execute_transaction(&[
+                "UPDATE side.main.acct SET bal = 0".into(),
+                "SELECT error('boom')".into(),
+            ])
+            .is_err());
+        assert_eq!(client.meta_rows("SELECT bal FROM side.main.acct").unwrap()[0][0].as_deref(), Some("10"));
+        client.execute_transaction(&["UPDATE side.main.acct SET bal = 5".into()]).unwrap();
+        assert_eq!(client.meta_rows("SELECT bal FROM side.main.acct").unwrap()[0][0].as_deref(), Some("5"));
+
+        // Timing: repeated small queries on the warm session.
+        let t = Instant::now();
+        for _ in 0..10 {
+            one(&client, "SELECT 1", None);
+        }
+        println!("10 small queries: {:?}", t.elapsed());
+    }
+
+    /// Run a query, pause while the server is restarted, run another.
+    #[test]
+    #[ignore]
+    fn quack_session_lost() {
+        let client = client();
+        assert_eq!(one(&client, "SELECT 1", None), "1");
+        println!("restart the server now");
+        std::thread::sleep(Duration::from_secs(8));
+        assert_eq!(one(&client, "SELECT 2", None), "2");
+        assert_eq!(client.meta_rows("SELECT 3").unwrap()[0][0].as_deref(), Some("3"));
     }
 }
