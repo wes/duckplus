@@ -58,8 +58,9 @@ codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
 
 if [[ "$NOTARIZE" == 1 ]]; then
   echo "==> Notarizing (this usually takes a few minutes)…"
-  if ! xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait \
-      | tee target/bundle/notarize.log | grep -q "status: Accepted"; then
+  xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait \
+    | tee target/bundle/notarize.log
+  if ! grep -q "status: Accepted" target/bundle/notarize.log; then
     ID=$(grep -m1 -o 'id: [0-9a-f-]*' target/bundle/notarize.log | cut -d' ' -f2)
     echo "Notarization failed. Details:"
     [[ -n "$ID" ]] && xcrun notarytool log "$ID" --keychain-profile "$PROFILE"
