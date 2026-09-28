@@ -22,6 +22,8 @@ DuckPlus checks for new versions on launch and every few hours (or via **DuckPlu
 - **SQL editor.** Tree-sitter highlighting and line numbers. ⌘↵ runs the whole buffer or just the selection.
 - **Schema-aware autocomplete.** Tables after `FROM`/`JOIN`, columns from the tables in your query (aliases, CTEs, and subqueries included), `alias.` for one table's columns, and the server's own functions and keywords. Names are quoted when they need it.
 - **Results grid.** Virtualized and cell-selectable. Results stay as Arrow batches from DuckDB and a cell is formatted only when it's on screen, so 100k-row results stay smooth.
+- **Export results** to CSV, or to SQL (`CREATE TABLE` plus `INSERT`s with the exact column types). If the row limit cut the grid short, a read-only query is re-run so the file has every row.
+- **Export tables** (File → Export Tables…): pick tables and, for SQL, whether each gets its structure (the real `CREATE TABLE`, keys and defaults included), a `DROP TABLE IF EXISTS` first, and its data. SQL is one script; CSV is a file per table, with header, delimiter and NULL options. Either can be gzipped, and rows stream straight from the server to the file.
 - **CSV import.** Drop CSV files anywhere on a workspace, or pick them from the sidebar. Name each table, then watch them load side by side with a progress bar per file.
 - **Guardrails.** `DROP`, `DELETE`, and `TRUNCATE` need a second ⌘↵. There's a configurable row limit, a live query timer, and Cancel (⌘.).
 - **JetBrains Mono built in** for the editor, the grid, and table names, so it looks the same on every machine. Light and dark themes follow the OS or can be pinned in Settings.
@@ -150,6 +152,7 @@ src/theme.rs        DuckPlus Night / Day themes (assets/themes/duckplus.json)
 src/connections.rs  launcher window
 src/workspace.rs    workspace window: schema tree, editor, results
 src/workspace/import.rs  CSV import: drop/pick, naming dialog, progress
+src/workspace/export_tables.rs  Export Tables dialog: pick tables, SQL or CSV
 src/complete.rs     schema-aware SQL autocomplete
 src/results.rs      result grid delegate (lazy cell formatting)
 src/settings.rs     settings window

@@ -633,6 +633,220 @@ mod ui_tests {
         import_and_check(cx, s).await;
     }
 
+    /// Export a result the row limit cut short: the file still has every row.
+    #[gpui_kit::test]
+    async fn export_writes_all_rows(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        s.check.run("CREATE TABLE big AS FROM range(20) t(i)", 1, None).unwrap();
+        cx.update(|cx| AppState::update_store(cx, |store| store.settings.row_limit = 5));
+        let workspace = s.workspace.clone();
+        cx.update_window(s.window, |_, window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.run_sql("FROM big ORDER BY i".into(), true, super::ResultSource::Query, None, window, cx)
+            });
+        })
+        .unwrap();
+        cx.wait_for(s.window, Duration::from_secs(5), |window, _| window.try_find("export").is_some())
+            .await;
+        let out = s.dir.join("big.csv");
+        let answer = out.clone();
+        cx.update_window(s.window, |_, window, cx| {
+            workspace.update(cx, |this, cx| this.export_results(false, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(move |_| Some(answer));
+        for _ in 0..100 {
+            cx.run_until_parked();
+            let notice = cx.update(|cx| workspace.read(cx).notice.clone());
+            if let Some((false, msg)) = &notice
+                && msg.starts_with("Exported")
+            {
+                assert_eq!(msg, "Exported 20 rows to big.csv");
+                let csv = std::fs::read_to_string(&out).unwrap();
+                assert_eq!(csv.lines().count(), 21, "{csv}");
+                std::fs::remove_dir_all(&s.dir).ok();
+                return;
+            }
+            assert!(!matches!(notice, Some((true, _))), "{notice:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("export never finished");
+    }
+
+    /// Export Tables: the dialog opens with the viewed table picked, SQL by
+    /// default, and writes a script; switching to CSV writes that table's file.
+    #[gpui_kit::test]
+    async fn export_tables_dialog(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        s.check
+            .run("CREATE SCHEMA sales; CREATE TABLE sales.orders (id INTEGER PRIMARY KEY, total DECIMAL(8,2)); \
+                  INSERT INTO sales.orders VALUES (1, 9.50), (2, 20); CREATE TABLE other AS SELECT 1 AS x; SELECT 1", 1, None)
+            .unwrap();
+        let workspace = s.workspace.clone();
+        let wait_notice = async |cx: &mut TestAppContext, prefix: &str| -> String {
+            for _ in 0..100 {
+                cx.run_until_parked();
+                if let Some((is_error, msg)) = cx.update(|cx| workspace.read(cx).notice.clone()) {
+                    assert!(!is_error, "{msg}");
+                    if msg.starts_with(prefix) {
+                        return msg;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("no {prefix:?} notice");
+        };
+        cx.update_window(s.window, |_, window, cx| workspace.update(cx, |this, cx| this.refresh_catalog(window, cx)))
+            .unwrap();
+        cx.run_until_parked();
+        // Nothing picked: ticking a table's Data box enables Export.
+        cx.update_window(s.window, |_, window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected_relation = None;
+                this.open_tables_export(window, cx);
+            });
+        })
+        .unwrap();
+        cx.wait_for(s.window, Duration::from_secs(2), |window, _| window.try_find("export-tables-ok").is_some())
+            .await;
+        cx.update_window(s.window, |_, window, cx| {
+            window.within("dialog").click("export-tables-ok", cx); // disabled: nothing happens
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(!cx.did_prompt_for_new_path(), "Export must be disabled with nothing picked");
+        cx.update_window(s.window, |_, window, cx| {
+            // Tables sort main.other, sales.orders; Data is the third box.
+            window.within("dialog").click(("pick", 1usize * 3 + 2), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(s.window, |_, window, cx| {
+            window.within("dialog").click("export-tables-ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let data_only = s.dir.join("data_only.sql");
+        let answer = data_only.clone();
+        cx.simulate_new_path_selection(move |_| Some(answer));
+        assert_eq!(wait_notice(cx, "Exported").await, "Exported 1 table (2 rows) to data_only.sql");
+        let text = std::fs::read_to_string(&data_only).unwrap();
+        assert!(text.contains("INSERT INTO \"sales\".\"orders\"") && !text.contains("CREATE"), "{text}");
+        cx.update(|cx| workspace.update(cx, |this, _| this.notice = None));
+
+        for (format_button, file, expect) in [
+            (None, "tables.sql", "Exported 1 table (2 rows) to tables.sql"),
+            (Some("format-csv"), "orders.csv", "Exported 1 table (2 rows) to orders.csv"),
+        ] {
+            cx.update_window(s.window, |_, window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.refresh_catalog(window, cx);
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(s.window, |_, window, cx| {
+                workspace.update(cx, |this, cx| {
+                    let rel = this.catalog.relations.iter().find(|r| r.name == "orders").unwrap().clone();
+                    this.selected_relation = Some(rel.qualified());
+                    this.open_tables_export(window, cx);
+                });
+            })
+            .unwrap();
+            cx.wait_for(s.window, Duration::from_secs(2), |window, _| window.try_find("export-tables-ok").is_some())
+                .await;
+            cx.update_window(s.window, |_, window, cx| {
+                assert!(window.within("dialog").find("format-sql").visible());
+                if let Some(button) = format_button {
+                    window.within("dialog").click(button, cx);
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(s.window, |_, window, cx| {
+                window.within("dialog").click("export-tables-ok", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            let out = s.dir.join(file);
+            let answer = out.clone();
+            cx.simulate_new_path_selection(move |_| Some(answer));
+            assert_eq!(wait_notice(cx, "Exported").await, expect);
+            let text = std::fs::read_to_string(&out).unwrap();
+            if file.ends_with(".sql") {
+                assert!(text.contains("CREATE SCHEMA IF NOT EXISTS \"sales\";"), "{text}");
+                assert!(text.contains("CREATE TABLE sales.orders(id INTEGER PRIMARY KEY"), "{text}");
+                assert!(!text.contains("\"other\""), "only the picked table: {text}");
+            } else {
+                assert_eq!(text, "id,total\n1,9.50\n2,20.00\n");
+            }
+            cx.update(|cx| workspace.update(cx, |this, _| this.notice = None));
+        }
+        std::fs::remove_dir_all(&s.dir).ok();
+    }
+
+    /// Tables picked in the sidebar with ⌘- and ⇧-click come into the
+    /// dialog ticked; a right-click outside the pick acts on that table alone.
+    #[gpui_kit::test]
+    async fn export_marked_tables(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        s.check
+            .run("CREATE TABLE t1 AS SELECT 1 AS x; CREATE TABLE t2 AS SELECT 2 AS x; \
+                  CREATE TABLE t3 AS SELECT 3 AS x; CREATE TABLE t4 AS SELECT 4 AS x; SELECT 1", 1, None)
+            .unwrap();
+        let workspace = s.workspace.clone();
+        cx.update_window(s.window, |_, window, cx| workspace.update(cx, |this, cx| this.refresh_catalog(window, cx)))
+            .unwrap();
+        cx.run_until_parked();
+        let q = |cx: &mut TestAppContext, name: &str| {
+            cx.update(|cx| {
+                workspace.read(cx).catalog.relations.iter().find(|r| r.name == name).unwrap().qualified()
+            })
+        };
+        let (t1, t2, t3, t4) = (q(cx, "t1"), q(cx, "t2"), q(cx, "t3"), q(cx, "t4"));
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                // t1 open, ⇧-click t3 (t1…t3), ⌘-click t2 off.
+                this.selected_relation = Some(t1.clone());
+                this.mark_anchor = Some(t1.clone());
+                this.mark_range(t3.clone(), cx);
+                assert_eq!(this.marked.len(), 3);
+                this.toggle_mark(t2.clone(), cx);
+                let mut picked = this.picked_relations();
+                picked.sort();
+                assert_eq!(picked, vec![t1.clone(), t3.clone()]);
+                assert_eq!(this.context_relations(&t3).len(), 2);
+                assert_eq!(this.context_relations(&t4), vec![t4.clone()]);
+            })
+        });
+        cx.update_window(s.window, |_, window, cx| workspace.update(cx, |this, cx| this.open_tables_export(window, cx)))
+            .unwrap();
+        cx.wait_for(s.window, Duration::from_secs(2), |window, _| window.try_find("export-tables-ok").is_some())
+            .await;
+        cx.update_window(s.window, |_, window, cx| window.within("dialog").click("export-tables-ok", cx))
+            .unwrap();
+        cx.run_until_parked();
+        let out = s.dir.join("marked.sql");
+        let answer = out.clone();
+        cx.simulate_new_path_selection(move |_| Some(answer));
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if let Some((is_error, msg)) = cx.update(|cx| workspace.read(cx).notice.clone()) {
+                assert!(!is_error, "{msg}");
+                if msg.starts_with("Exported") {
+                    assert!(msg.starts_with("Exported 2 tables"), "{msg}");
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("t1") && text.contains("t3"), "{text}");
+        assert!(!text.contains("t2") && !text.contains("t4"), "{text}");
+        std::fs::remove_dir_all(&s.dir).ok();
+    }
+
     /// Dropped right after typing in the editor, which is when GPUI's own
     /// `on_drop` misses it, and over the results grid, which occludes.
     #[gpui_kit::test]

@@ -15,7 +15,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Root, Sizable as _, StyledExt as _, TitleBar, WindowExt as _, h_flex,
@@ -24,17 +24,22 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+mod export_tables;
 mod import;
 
 use crate::complete::{SchemaIndex, SqlCompletions};
-use crate::quack::{Catalog, KeyKind, QuackClient, Relation, ServerInfo, quote_ident, sql_literal};
+use crate::quack::{
+    Catalog, ExportFormat, ExportRows, KeyKind, QuackClient, Relation, ServerInfo,
+    is_read_only_query, quote_ident, sql_literal,
+};
 use crate::query_log::{LogStatus, QueryLog};
 use crate::results::{CellEditor, ResultsDelegate};
 use crate::store::Profile;
 use crate::theme::tag_color;
 use crate::{
     AppState, CancelQuery, CopyCsv, DiscardChanges, EditCell, FocusEditor, FocusFilter, FormatSql,
-    InspectCell, NewQuery, OpenConnections, OpenSettings, RefreshSchema, RunAll, RunQuery,
+    ExportCsv, ExportSql, ExportTables, InspectCell, NewQuery, OpenConnections, OpenSettings, RefreshSchema,
+    RunAll, RunQuery,
     SaveChanges, ToggleComment, ToggleQueryLog,
 };
 
@@ -143,6 +148,11 @@ pub struct Workspace {
     loading_catalog: bool,
     collapsed: HashSet<String>,
     selected_relation: Option<String>,
+    /// Tables picked in the sidebar with ⌘- or ⇧-click (qualified names).
+    /// Empty means just the open one, `selected_relation`.
+    marked: HashSet<String>,
+    /// Where a ⇧-click range starts.
+    mark_anchor: Option<String>,
     filter: Entity<InputState>,
     editor: Entity<EditorState>,
     completions: Rc<SqlCompletions>,
@@ -178,6 +188,9 @@ pub struct Workspace {
     catalog_dirty: bool,
     /// Files being dragged over the window from outside.
     dropping: Option<Vec<std::path::PathBuf>>,
+    /// The SQL (and database) behind the rows in the grid, for exports.
+    shown_query: Option<(String, Option<String>)>,
+    exporting: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -291,6 +304,8 @@ impl Workspace {
             loading_catalog: false,
             collapsed: HashSet::new(),
             selected_relation: None,
+            marked: HashSet::new(),
+            mark_anchor: None,
             filter,
             editor,
             completions,
@@ -315,6 +330,8 @@ impl Workspace {
             import_ticking: false,
             catalog_dirty: false,
             dropping: None,
+            shown_query: None,
+            exporting: false,
             _subs: subs,
         };
         this.refresh_catalog(window, cx);
@@ -436,6 +453,7 @@ impl Workspace {
         let client = self.client.clone();
         let limit = settings.row_limit;
         let database = self.focus_db.clone();
+        let ran = (sql.clone(), database.clone());
         let query = cx
             .background_executor()
             .spawn(async move { client.run(&sql, limit, database.as_deref()) });
@@ -485,6 +503,7 @@ impl Workspace {
                         };
                         let r = Arc::new(r);
                         this.source = this.pending_source.clone();
+                        this.shown_query = Some(ran);
                         // A server-sorted table keeps its header arrow.
                         let sort = match &this.source {
                             ResultSource::Table {
@@ -1248,6 +1267,91 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Save the results to a file the user picks, as CSV or as SQL.
+    fn export_results(&mut self, as_sql: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(result) = self.table.read(cx).delegate().result.clone() else {
+            return;
+        };
+        if self.exporting || matches!(self.run, RunState::Running(_)) {
+            return;
+        }
+        // All rows are in hand unless the row limit cut them off; then run a
+        // read-only query again for the rest (never one that changes data).
+        let rerun = match &self.source {
+            _ if !result.truncated => None,
+            ResultSource::Table { rel, sort, sql: None, .. } => {
+                let order = sort.as_ref().map_or(String::new(), |(col, desc)| {
+                    format!(" ORDER BY {} {} NULLS LAST", quote_ident(col), if *desc { "DESC" } else { "ASC" })
+                });
+                Some((format!("FROM {}{order}", self.short_name(rel)), self.focus_db.clone()))
+            }
+            _ => self.shown_query.clone().filter(|(sql, _)| is_read_only_query(sql)),
+        };
+        let partial = result.truncated && rerun.is_none();
+        let name = match &self.source {
+            ResultSource::Table { rel, .. } => rel.name.clone(),
+            ResultSource::Query => self.run_label.clone().unwrap_or_else(|| "query_results".into()),
+        };
+        let stem: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let format = if as_sql {
+            ExportFormat::Sql { table: stem.clone() }
+        } else {
+            ExportFormat::Csv
+        };
+        let file = format!("{stem}.{}", if as_sql { "sql" } else { "csv" });
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let path = cx.prompt_for_new_path(&dir, Some(&file));
+        let client = self.client.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = path.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.exporting = true;
+                this.notice = Some((false, "Exporting…".into()));
+                cx.notify();
+            })
+            .ok();
+            let written = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move {
+                        let rows = match &rerun {
+                            Some((sql, db)) => ExportRows::Query { sql, database: db.as_deref() },
+                            None => ExportRows::Loaded(&result),
+                        };
+                        client.export(rows, &format, &path)
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.exporting = false;
+                let file = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                this.notice = Some(match written {
+                    Ok(n) => (
+                        false,
+                        format!(
+                            "Exported {} {} to {file}{}",
+                            group_digits(n as usize),
+                            if n == 1 { "row" } else { "rows" },
+                            if partial { " (only the loaded rows: this query can't be re-run safely)" } else { "" }
+                        ),
+                    ),
+                    Err(e) => (true, format!("Export failed: {e:#}")),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn copy_results(&mut self, cx: &mut Context<Self>) {
         if let Some(r) = self.table.read(cx).delegate().result.clone() {
             cx.write_to_clipboard(ClipboardItem::new_string(r.to_tsv()));
@@ -1413,14 +1517,7 @@ impl Workspace {
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut last_db: Option<&str> = None;
         let mut last_schema: Option<(&str, &str)> = None;
-        let relations: Vec<(usize, &Relation)> = self
-            .catalog
-            .relations
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| !filtering || r.name.to_lowercase().contains(&needle))
-            .filter(|(_, r)| self.focus_db.as_ref().is_none_or(|db| &r.database == db))
-            .collect();
+        let relations = self.sidebar_relations(&needle);
         // With a focused database its level is implied, so schemas become roots.
         let base = if self.focus_db.is_some() { 0 } else { 1 };
 
@@ -1545,6 +1642,7 @@ impl Workspace {
                                     .tooltip(*label)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.selected_relation = None;
+                                        this.marked.clear();
                                         this.run_sql(
                                             sql.to_string(),
                                             true,
@@ -1555,6 +1653,16 @@ impl Workspace {
                                         );
                                     }))
                             }),
+                    )
+                    .child(
+                        Button::new("export-tables")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Download)
+                            .tooltip("Export tables…")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_tables_export(window, cx)
+                            })),
                     )
                     .child(
                         Button::new("import-csv")
@@ -1568,6 +1676,78 @@ impl Workspace {
                             })),
                     ),
             )
+    }
+
+    /// The relations the sidebar lists for a filter, in order, with their
+    /// index in the catalog.
+    fn sidebar_relations(&self, needle: &str) -> Vec<(usize, &Relation)> {
+        self.catalog
+            .relations
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| needle.is_empty() || r.name.to_lowercase().contains(needle))
+            .filter(|(_, r)| self.focus_db.as_ref().is_none_or(|db| &r.database == db))
+            .collect()
+    }
+
+    /// The tables highlighted in the sidebar: the marked ones, else the open one.
+    pub(super) fn picked_relations(&self) -> Vec<String> {
+        if self.marked.is_empty() {
+            self.selected_relation.iter().cloned().collect()
+        } else {
+            self.marked.iter().cloned().collect()
+        }
+    }
+
+    /// What a right-click on `qualified` acts on: the whole pick when it's
+    /// part of it, else just that one.
+    fn context_relations(&self, qualified: &str) -> Vec<String> {
+        let picked = self.picked_relations();
+        if picked.iter().any(|q| q == qualified) {
+            picked
+        } else {
+            vec![qualified.to_string()]
+        }
+    }
+
+    /// ⌘-click: add a table to the pick, or take it out.
+    fn toggle_mark(&mut self, qualified: String, cx: &mut Context<Self>) {
+        if self.marked.is_empty() {
+            self.marked.extend(self.selected_relation.clone());
+        }
+        if !self.marked.remove(&qualified) {
+            self.marked.insert(qualified.clone());
+        }
+        self.mark_anchor = Some(qualified);
+        cx.notify();
+    }
+
+    /// ⇧-click: pick every listed table between the anchor and this one.
+    fn mark_range(&mut self, qualified: String, cx: &mut Context<Self>) {
+        let Some(anchor) = self.mark_anchor.clone().or_else(|| self.selected_relation.clone()) else {
+            return self.toggle_mark(qualified, cx);
+        };
+        let needle = self.filter.read(cx).value().to_lowercase();
+        let filtering = !needle.is_empty();
+        // Only what's on screen: rows inside collapsed groups are skipped.
+        let listed: Vec<String> = self
+            .sidebar_relations(&needle)
+            .into_iter()
+            .filter(|(_, r)| {
+                filtering
+                    || !(self.collapsed.contains(&r.database)
+                        || self.collapsed.contains(&format!("{}.{}", r.database, r.schema)))
+            })
+            .map(|(_, r)| r.qualified())
+            .collect();
+        let (Some(a), Some(b)) = (
+            listed.iter().position(|q| *q == anchor),
+            listed.iter().position(|q| *q == qualified),
+        ) else {
+            return self.toggle_mark(qualified, cx);
+        };
+        self.marked = listed[a.min(b)..=a.max(b)].iter().cloned().collect();
+        cx.notify();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1607,9 +1787,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let active = self.selected_relation.as_deref() == Some(rel.qualified().as_str());
+        let qualified = rel.qualified();
+        let active = if self.marked.is_empty() {
+            self.selected_relation.as_deref() == Some(qualified.as_str())
+        } else {
+            self.marked.contains(&qualified)
+        };
         let rel_open = rel.clone();
         let rel_describe = rel.clone();
+        let view = cx.entity().downgrade();
+        let menu_rel = rel.clone();
         let (icon, color) = if rel.is_view {
             (IconName::Eye, theme.magenta)
         } else {
@@ -1647,9 +1834,64 @@ impl Workspace {
                             })),
                     ),
             )
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.open_relation(&rel_open, window, cx)),
-            )
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                let modifiers = event.modifiers();
+                if modifiers.shift {
+                    this.mark_range(rel_open.qualified(), cx);
+                } else if modifiers.secondary() {
+                    this.toggle_mark(rel_open.qualified(), cx);
+                } else {
+                    this.marked.clear();
+                    this.mark_anchor = Some(rel_open.qualified());
+                    this.open_relation(&rel_open, window, cx);
+                }
+            }))
+            .context_menu(move |menu, _, cx| {
+                let Some(workspace) = view.upgrade() else {
+                    return menu;
+                };
+                let targets = workspace.read(cx).context_relations(&menu_rel.qualified());
+                let tables = workspace
+                    .read(cx)
+                    .catalog
+                    .relations
+                    .iter()
+                    .filter(|r| !r.is_view && targets.contains(&r.qualified()))
+                    .count();
+                let (open, describe, export) = (view.clone(), view.clone(), view.clone());
+                let (open_rel, describe_rel) = (menu_rel.clone(), menu_rel.clone());
+                let one = targets.len() == 1;
+                menu.when(one, |menu| {
+                    menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
+                        open.update(cx, |this, cx| {
+                            this.marked.clear();
+                            this.open_relation(&open_rel, window, cx)
+                        })
+                        .ok();
+                    }))
+                    .item(PopupMenuItem::new("Structure").on_click(move |_, window, cx| {
+                        describe
+                            .update(cx, |this, cx| this.describe_relation(&describe_rel, window, cx))
+                            .ok();
+                    }))
+                    .separator()
+                })
+                .item(
+                    PopupMenuItem::new(if tables > 1 {
+                        format!("Export {tables} Tables…")
+                    } else {
+                        "Export Table…".to_string()
+                    })
+                    .icon(IconName::Download)
+                    .disabled(tables == 0)
+                    .on_click(move |_, window, cx| {
+                        let targets = targets.clone();
+                        export
+                            .update(cx, |this, cx| this.open_tables_export_with(targets, window, cx))
+                            .ok();
+                    }),
+                )
+            })
     }
 
     /// For tables without a primary key: which column rows are updated by,
@@ -1873,7 +2115,35 @@ impl Workspace {
                         )
                     })
                     .when(has_result && !running, |el| {
+                        let view = cx.entity().downgrade();
                         el.child(
+                            Button::new("export")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Download)
+                                .label("Export")
+                                .loading(self.exporting)
+                                .dropdown_menu(move |menu, _, _| {
+                                    let (csv, sql) = (view.clone(), view.clone());
+                                    menu.item(PopupMenuItem::new("Export as CSV…").on_click(
+                                        move |_, window, cx| {
+                                            csv.update(cx, |this, cx| {
+                                                this.export_results(false, window, cx)
+                                            })
+                                            .ok();
+                                        },
+                                    ))
+                                    .item(PopupMenuItem::new("Export as SQL…").on_click(
+                                        move |_, window, cx| {
+                                            sql.update(cx, |this, cx| {
+                                                this.export_results(true, window, cx)
+                                            })
+                                            .ok();
+                                        },
+                                    ))
+                                }),
+                        )
+                        .child(
                             Button::new("copy")
                                 .ghost()
                                 .xsmall()
@@ -1965,6 +2235,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_query))
             .on_action(cx.listener(Self::on_toggle_comment))
             .on_action(cx.listener(Self::on_copy_csv))
+            .on_action(cx.listener(|this, _: &ExportCsv, window, cx| {
+                this.export_results(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportSql, window, cx| {
+                this.export_results(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportTables, window, cx| {
+                this.open_tables_export(window, cx)
+            }))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_format))
             .on_action(cx.listener(Self::on_toggle_log))

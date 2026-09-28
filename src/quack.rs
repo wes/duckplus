@@ -10,6 +10,8 @@
 //! cells on screen are ever turned into strings.
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -20,6 +22,7 @@ use duckdb::arrow::array::{Array, RecordBatch};
 use duckdb::arrow::compute::{SortOptions, cast, concat, sort_to_indices};
 use duckdb::arrow::datatypes::{DataType, Schema};
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
+use duckdb::vtab::arrow::{ArrowVTab, arrow_recordbatch_to_query_params};
 use duckdb::{AccessMode, Config, Connection, InterruptHandle};
 use serde::{Deserialize, Serialize};
 
@@ -700,6 +703,187 @@ impl QuackClient {
         })
     }
 
+    /// Write result rows to `path` as CSV, or as SQL that recreates them.
+    /// The rows are staged in a temp table in the embedded DuckDB, so DuckDB
+    /// writes the CSV and knows each column's exact type for the SQL.
+    pub fn export(&self, rows: ExportRows, format: &ExportFormat, path: &Path) -> Result<u64> {
+        let conn = self.inner.base.lock().unwrap().try_clone()?;
+        let stage = quote_ident(&format!("__duckplus_export_{}", uuid::Uuid::new_v4().simple()));
+        let result = (|| -> Result<u64> {
+            match rows {
+                ExportRows::Loaded(r) => {
+                    // Already registered on this database is fine.
+                    let _ = conn.register_table_function::<ArrowVTab>("arrow");
+                    if r.batches.is_empty() {
+                        let cols: Vec<String> = r
+                            .columns
+                            .iter()
+                            .map(|c| format!("{} VARCHAR", quote_ident(&c.name)))
+                            .collect();
+                        conn.execute_batch(&format!("CREATE TEMP TABLE {stage} ({})", cols.join(", ")))?;
+                    }
+                    for (i, batch) in r.batches.iter().enumerate() {
+                        let sql = if i == 0 {
+                            format!("CREATE TEMP TABLE {stage} AS SELECT * FROM arrow(?, ?)")
+                        } else {
+                            format!("INSERT INTO {stage} SELECT * FROM arrow(?, ?)")
+                        };
+                        conn.prepare(&sql)?
+                            .execute(arrow_recordbatch_to_query_params(batch.clone()))?;
+                    }
+                }
+                ExportRows::Query { sql, database } if self.is_local() => {
+                    if let Some(db) = database {
+                        conn.execute_batch(&format!("USE {}", quote_ident(db)))?;
+                    }
+                    let sql = sql.trim().trim_end_matches(';');
+                    conn.execute_batch(&format!("CREATE TEMP TABLE {stage} AS {sql}"))
+                        .map_err(|e| self.clean_error(e))?;
+                }
+                ExportRows::Query { sql, database } => {
+                    self.remote_call(Lane::Query, sql, database, |q| {
+                        conn.execute_batch(&format!("CREATE TEMP TABLE {stage} AS {q}"))
+                    })?;
+                }
+            }
+            let count: u64 = conn.query_row(&format!("SELECT count(*) FROM {stage}"), [], |r| r.get(0))?;
+            match format {
+                ExportFormat::Csv => conn.execute_batch(&format!(
+                    "COPY {stage} TO {} (HEADER, DELIMITER ',')",
+                    sql_literal(&path.to_string_lossy())
+                ))?,
+                ExportFormat::Sql { table } => write_sql(&conn, &stage, table, path)?,
+            }
+            Ok(count)
+        })();
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {stage}"));
+        result
+    }
+
+    /// Export several tables. SQL is one script at `dest`; CSV is a file per
+    /// table, into `dest` when it's a folder or at `dest` for a single table.
+    /// Rows stream from the server straight to the file. `done` counts the
+    /// tables finished so far. Returns the rows written.
+    pub fn export_tables(
+        &self,
+        tables: &[TableExport],
+        format: &TablesFormat,
+        dest: &Path,
+        done: &AtomicU64,
+    ) -> Result<u64> {
+        let conn = self.inner.base.lock().unwrap().try_clone()?;
+        let mut total = 0;
+        match format {
+            TablesFormat::Sql { gzip } => {
+                let mut out = Output::create(dest, *gzip)?;
+                writeln!(out, "-- Exported from DuckPlus")?;
+                let mut schemas: Vec<&str> = tables
+                    .iter()
+                    .filter(|t| t.structure && t.rel.schema != "main")
+                    .map(|t| t.rel.schema.as_str())
+                    .collect();
+                schemas.dedup();
+                for schema in schemas {
+                    writeln!(out, "CREATE SCHEMA IF NOT EXISTS {};", quote_ident(schema))?;
+                }
+                for t in tables {
+                    let name = portable_name(&t.rel);
+                    writeln!(out, "\n-- {}.{}", t.rel.schema, t.rel.name)?;
+                    if t.drop {
+                        writeln!(out, "DROP TABLE IF EXISTS {name};")?;
+                    }
+                    let cols = if t.structure || t.data { self.table_columns(&t.rel)? } else { Vec::new() };
+                    if t.structure {
+                        match self.table_ddl(&t.rel)? {
+                            Some(ddl) => writeln!(out, "{}", ddl.trim_end().trim_end_matches(';').to_string() + ";")?,
+                            None => write_create(&mut out, &name, &cols)?,
+                        }
+                    }
+                    if t.data {
+                        let types: Vec<String> = cols.iter().map(|(_, ty)| ty.clone()).collect();
+                        let out = std::cell::RefCell::new(&mut out);
+                        let select = |q: &str| -> duckdb::Result<Result<u64>> {
+                            let mut stmt = conn.prepare(&format!("SELECT COLUMNS(*)::VARCHAR FROM ({q})"))?;
+                            let mut rows = stmt.query([])?;
+                            Ok(write_inserts(&mut rows, &types, &name, *out.borrow_mut()))
+                        };
+                        let source = format!("FROM {}", t.rel.qualified());
+                        total += if self.is_local() {
+                            select(&source).map_err(|e| self.clean_error(e))??
+                        } else {
+                            self.remote_call(Lane::Query, &source, None, select)??
+                        };
+                    }
+                    done.fetch_add(1, Relaxed);
+                }
+                out.finish()?;
+            }
+            TablesFormat::Csv { header, delimiter, null_as_empty, gzip } => {
+                let qualify = tables.iter().any(|t| t.rel.schema != "main");
+                for t in tables.iter().filter(|t| t.data) {
+                    let path = if dest.is_dir() {
+                        let stem = if qualify { format!("{}.{}", t.rel.schema, t.rel.name) } else { t.rel.name.clone() };
+                        dest.join(format!("{}.{}", stem.replace('/', "_"), format.extension()))
+                    } else {
+                        dest.to_path_buf()
+                    };
+                    let options = format!(
+                        "HEADER {header}, DELIMITER {}, NULLSTR {}{}",
+                        sql_literal(&delimiter.to_string()),
+                        sql_literal(if *null_as_empty { "" } else { "NULL" }),
+                        if *gzip { ", COMPRESSION gzip" } else { "" }
+                    );
+                    let copy = |q: &str| {
+                        conn.execute(
+                            &format!("COPY ({q}) TO {} ({options})", sql_literal(&path.to_string_lossy())),
+                            [],
+                        )
+                    };
+                    let source = format!("FROM {}", t.rel.qualified());
+                    total += if self.is_local() {
+                        copy(&source).map_err(|e| self.clean_error(e))?
+                    } else {
+                        self.remote_call(Lane::Query, &source, None, copy)?
+                    } as u64;
+                    done.fetch_add(1, Relaxed);
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// A table's columns and their types, in order.
+    fn table_columns(&self, rel: &Relation) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .meta_rows(&format!(
+                "SELECT column_name, data_type FROM duckdb_columns() \
+                 WHERE database_name = {} AND schema_name = {} AND table_name = {} ORDER BY column_index",
+                sql_literal(&rel.database),
+                sql_literal(&rel.schema),
+                sql_literal(&rel.name)
+            ))?
+            .into_iter()
+            .map(|r| (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default()))
+            .collect())
+    }
+
+    /// The `CREATE TABLE` statement DuckDB keeps for a table (with its keys,
+    /// defaults and checks), if the catalog has one.
+    fn table_ddl(&self, rel: &Relation) -> Result<Option<String>> {
+        Ok(self
+            .meta_rows(&format!(
+                "SELECT sql FROM duckdb_tables() \
+                 WHERE database_name = {} AND schema_name = {} AND table_name = {}",
+                sql_literal(&rel.database),
+                sql_literal(&rel.schema),
+                sql_literal(&rel.name)
+            ))?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next().flatten())
+            .filter(|sql| !sql.trim().is_empty()))
+    }
+
     /// Load every non-internal relation on the server in a single round trip.
     pub fn catalog(&self) -> Result<Catalog> {
         let rows = self.meta_rows(
@@ -806,6 +990,220 @@ fn normalize_batch(batch: RecordBatch) -> RecordBatch {
         }
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap_or(batch)
+}
+
+/// What an export writes.
+#[derive(Debug, Clone)]
+pub enum ExportFormat {
+    Csv,
+    /// `CREATE TABLE` plus `INSERT`s that recreate the rows as `table`.
+    Sql { table: String },
+}
+
+/// Where an export's rows come from.
+pub enum ExportRows<'a> {
+    /// The rows already fetched.
+    Loaded(&'a QueryResult),
+    /// Run this read-only statement again, without the grid's row limit.
+    Query { sql: &'a str, database: Option<&'a str> },
+}
+
+/// Whether `sql` is one statement that only reads, so re-running it for an
+/// export can't change anything.
+pub fn is_read_only_query(sql: &str) -> bool {
+    let statements = split_statements(sql);
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+    let code = strip_comments(statement);
+    let code = code.trim_start();
+    if code.starts_with('(') {
+        return true;
+    }
+    let word: String = code
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    matches!(
+        word.as_str(),
+        "SELECT" | "FROM" | "WITH" | "VALUES" | "TABLE" | "SHOW" | "DESCRIBE" | "SUMMARIZE" | "PIVOT"
+            | "UNPIVOT"
+    )
+}
+
+/// `CREATE TABLE` with the staged columns' types, then `INSERT`s of 500 rows.
+/// Values are written as DuckDB's text for them, which it reads back into
+/// the same type; numbers and booleans go unquoted.
+fn write_sql(conn: &Connection, stage: &str, table: &str, path: &Path) -> Result<()> {
+    let mut cols: Vec<(String, String)> = Vec::new();
+    let mut stmt = conn.prepare(&format!("DESCRIBE {stage}"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        cols.push((row.get(0)?, row.get(1)?));
+    }
+    let types: Vec<String> = cols.iter().map(|(_, ty)| ty.clone()).collect();
+    let table = quote_ident(table);
+    let mut out = std::io::BufWriter::new(fs::File::create(path)?);
+    writeln!(out, "-- Exported from DuckPlus")?;
+    write_create(&mut out, &table, &cols)?;
+    let mut stmt = conn.prepare(&format!("SELECT COLUMNS(*)::VARCHAR FROM {stage}"))?;
+    write_inserts(&mut stmt.query([])?, &types, &table, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// `CREATE TABLE name (…)` from column names and types.
+fn write_create(out: &mut dyn Write, name: &str, cols: &[(String, String)]) -> Result<()> {
+    writeln!(out, "CREATE TABLE {name} (")?;
+    for (i, (col, ty)) in cols.iter().enumerate() {
+        let comma = if i + 1 < cols.len() { "," } else { "" };
+        writeln!(out, "  {} {ty}{comma}", quote_ident(col))?;
+    }
+    writeln!(out, ");")?;
+    Ok(())
+}
+
+/// `INSERT INTO name VALUES …` for `rows` (every column cast to VARCHAR), 500
+/// rows a statement. Values are DuckDB's text for them, which it reads back
+/// into the same type; numbers and booleans (per `types`) go unquoted.
+fn write_inserts(
+    rows: &mut duckdb::Rows,
+    types: &[String],
+    name: &str,
+    out: &mut dyn Write,
+) -> Result<u64> {
+    let unquoted: Vec<bool> = types
+        .iter()
+        .map(|ty| {
+            let ty = ty.to_ascii_uppercase();
+            ty.starts_with("DECIMAL")
+                || matches!(
+                    ty.as_str(),
+                    "BOOLEAN" | "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT"
+                        | "USMALLINT" | "UINTEGER" | "UBIGINT" | "UHUGEINT" | "FLOAT" | "DOUBLE"
+                )
+        })
+        .collect();
+    let mut written = 0u64;
+    let mut in_batch = 0;
+    while let Some(row) = rows.next()? {
+        if in_batch == 0 {
+            write!(out, "\nINSERT INTO {name} VALUES\n  (")?;
+        } else {
+            write!(out, ",\n  (")?;
+        }
+        for (i, plain) in unquoted.iter().enumerate() {
+            if i > 0 {
+                write!(out, ", ")?;
+            }
+            match row.get::<_, Option<String>>(i)? {
+                None => write!(out, "NULL")?,
+                // inf and nan are text even in numeric columns.
+                Some(v)
+                    if *plain
+                        && (v.parse::<f64>().is_ok_and(f64::is_finite) || v == "true" || v == "false") =>
+                {
+                    write!(out, "{v}")?
+                }
+                Some(v) => write!(out, "{}", sql_literal(&v))?,
+            }
+        }
+        write!(out, ")")?;
+        written += 1;
+        in_batch += 1;
+        if in_batch == 500 {
+            write!(out, ";")?;
+            in_batch = 0;
+        }
+    }
+    if in_batch > 0 {
+        write!(out, ";")?;
+    }
+    writeln!(out)?;
+    Ok(written)
+}
+
+/// One table in a multi-table export, and what to write for it.
+#[derive(Debug, Clone)]
+pub struct TableExport {
+    pub rel: Relation,
+    /// `CREATE TABLE` (SQL only).
+    pub structure: bool,
+    /// `DROP TABLE IF EXISTS` first (SQL only).
+    pub drop: bool,
+    pub data: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum TablesFormat {
+    /// One script with every selected table.
+    Sql { gzip: bool },
+    /// A file per table.
+    Csv { header: bool, delimiter: char, null_as_empty: bool, gzip: bool },
+}
+
+impl TablesFormat {
+    /// File extension for this format's output.
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Sql { gzip: false } => "sql",
+            Self::Sql { gzip: true } => "sql.gz",
+            Self::Csv { gzip: false, .. } => "csv",
+            Self::Csv { gzip: true, .. } => "csv.gz",
+        }
+    }
+}
+
+/// A plain or gzipped output file.
+enum Output {
+    Plain(std::io::BufWriter<fs::File>),
+    Gzip(flate2::write::GzEncoder<std::io::BufWriter<fs::File>>),
+}
+
+impl Output {
+    fn create(path: &Path, gzip: bool) -> Result<Self> {
+        let file = std::io::BufWriter::new(fs::File::create(path)?);
+        Ok(if gzip {
+            Self::Gzip(flate2::write::GzEncoder::new(file, flate2::Compression::default()))
+        } else {
+            Self::Plain(file)
+        })
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Plain(mut f) => f.flush()?,
+            Self::Gzip(gz) => gz.finish()?.flush()?,
+        }
+        Ok(())
+    }
+}
+
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(f) => f.write(buf),
+            Self::Gzip(gz) => gz.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(f) => f.flush(),
+            Self::Gzip(gz) => gz.flush(),
+        }
+    }
+}
+
+/// The name an exported script uses for `rel`: no database, and no schema
+/// when it's `main`, so the script loads into whatever database runs it.
+fn portable_name(rel: &Relation) -> String {
+    if rel.schema == "main" {
+        quote_ident(&rel.name)
+    } else {
+        format!("{}.{}", quote_ident(&rel.schema), quote_ident(&rel.name))
+    }
 }
 
 /// Live progress of one CSV import, shared with the UI.
@@ -1710,6 +2108,43 @@ mod quack_session_tests {
         println!("10 small queries: {:?}", t.elapsed());
     }
 
+    /// Exports through the server session, from loaded rows and re-runs.
+    #[test]
+    #[ignore]
+    fn quack_export() {
+        use super::{ExportFormat, ExportRows};
+        let client = client();
+        one(&client, "CREATE OR REPLACE TABLE exp AS SELECT i, 'row ' || i AS label, DATE '2024-01-01' + i::INT AS d FROM range(50) t(i)", None);
+        let dir = std::env::temp_dir().join(format!("duckplus-qexport-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("exp.csv");
+        let rows = ExportRows::Query { sql: "FROM exp ORDER BY i", database: None };
+        assert_eq!(client.export(rows, &ExportFormat::Csv, &csv).unwrap(), 50);
+        assert_eq!(std::fs::read_to_string(&csv).unwrap().lines().count(), 51);
+        let loaded = client.run("FROM exp ORDER BY i", 10, None).unwrap();
+        let sql = dir.join("exp.sql");
+        let fmt = ExportFormat::Sql { table: "exp_copy".into() };
+        assert_eq!(client.export(ExportRows::Loaded(&loaded), &fmt, &sql).unwrap(), 10);
+        let script = std::fs::read_to_string(&sql).unwrap();
+        assert!(script.contains("\"d\" DATE"), "{script}");
+        one(&client, &format!("{script}\nSELECT 1"), None);
+        assert_eq!(one(&client, "SELECT count(*) FROM exp_copy", None), "10");
+
+        // Whole tables: DDL from the server's catalog, rows streamed.
+        let rel = client.catalog().unwrap().relations.into_iter().find(|r| r.name == "exp").unwrap();
+        let t = super::TableExport { rel, structure: true, drop: true, data: true };
+        let done = std::sync::atomic::AtomicU64::new(0);
+        let out = dir.join("tables.sql");
+        let n = client.export_tables(&[t], &super::TablesFormat::Sql { gzip: false }, &out, &done).unwrap();
+        assert_eq!(n, 50);
+        let script = std::fs::read_to_string(&out).unwrap();
+        assert!(script.contains("CREATE TABLE exp("), "{script}");
+        one(&client, "DROP TABLE exp; SELECT 1", None);
+        one(&client, &format!("{script}\nSELECT 1"), None);
+        assert_eq!(one(&client, "SELECT count(*) FROM exp", None), "50");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// Run a query, pause while the server is restarted, run another.
     #[test]
     #[ignore]
@@ -1720,5 +2155,220 @@ mod quack_session_tests {
         std::thread::sleep(Duration::from_secs(8));
         assert_eq!(one(&client, "SELECT 2", None), "2");
         assert_eq!(client.meta_rows("SELECT 3").unwrap()[0][0].as_deref(), Some("3"));
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::{ExportFormat, ExportRows, QuackClient, is_read_only_query};
+
+    const TRICKY: &str = "SELECT * FROM (VALUES
+        (1, 'plain', DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05.678', 12.50::DECIMAL(9,2),
+         'inf'::DOUBLE, [1, 2, 3], {'a': 1, 'b': 'x'}, '\\x00\\xFF'::BLOB, true),
+        (2, 'it''s \"quoted\", with a comma
+and a newline', NULL, NULL, -0.01::DECIMAL(9,2), 1.5, [], NULL, NULL, false),
+        (3, NULL, DATE '1999-12-31', TIMESTAMP '1999-12-31 23:59:59', NULL, NULL, NULL,
+         {'a': NULL, 'b': 'y'}, ''::BLOB, NULL)
+    ) t(id, txt, d, ts, dec, dbl, lst, st, bl, flag)";
+
+    #[test]
+    fn exports_round_trip() {
+        let dir = std::env::temp_dir().join(format!("duckplus-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("x.duckdb");
+        duckdb::Connection::open(&db).unwrap();
+        let (client, _) = QuackClient::connect_local(&db, false).unwrap();
+        client.run(&format!("CREATE TABLE src AS {TRICKY}"), 1, None).unwrap();
+
+        // From the loaded rows and from a re-run, to both formats.
+        let loaded = client.run("FROM src ORDER BY id", 1000, None).unwrap();
+        let sources = [
+            ("loaded", ExportRows::Loaded(&loaded)),
+            ("rerun", ExportRows::Query { sql: "FROM src ORDER BY id;", database: None }),
+        ];
+        for (name, rows) in sources {
+            let sql_path = dir.join(format!("{name}.sql"));
+            let fmt = ExportFormat::Sql { table: format!("copy_{name}") };
+            assert_eq!(client.export(rows, &fmt, &sql_path).unwrap(), 3);
+            // Loading the file recreates identical rows.
+            let script = std::fs::read_to_string(&sql_path).unwrap();
+            client.run(&script, 1, None).unwrap();
+            let diff = client
+                .meta_rows(&format!(
+                    "SELECT count(*) FROM ((FROM src EXCEPT ALL FROM copy_{name}) \
+                     UNION ALL (FROM copy_{name} EXCEPT ALL FROM src))"
+                ))
+                .unwrap();
+            assert_eq!(diff[0][0].as_deref(), Some("0"), "{name}.sql:\n{script}");
+        }
+
+        let csv_path = dir.join("out.csv");
+        let rows = ExportRows::Query { sql: "FROM src ORDER BY id", database: None };
+        assert_eq!(client.export(rows, &ExportFormat::Csv, &csv_path).unwrap(), 3);
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        assert!(csv.starts_with("id,txt,d,ts,dec,dbl,lst,st,bl,flag\n"), "{csv}");
+        let back = client
+            .meta_rows(&format!(
+                "SELECT count(*), any_value(txt) FILTER (WHERE id = 2) FROM read_csv({}, header = true)",
+                super::sql_literal(&csv_path.to_string_lossy())
+            ))
+            .unwrap();
+        assert_eq!(back[0][0].as_deref(), Some("3"));
+        assert!(back[0][1].as_deref().unwrap().contains("comma\nand a newline"));
+
+        // No temp tables left behind.
+        let left = client
+            .meta_rows("SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE '__duckplus_export_%'")
+            .unwrap();
+        assert_eq!(left[0][0].as_deref(), Some("0"));
+        drop(client);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn read_only_queries() {
+        for sql in [
+            "SELECT 1",
+            "  -- hi\n from t limit 5;",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "(SELECT 1) UNION (SELECT 2)",
+            "describe t",
+        ] {
+            assert!(is_read_only_query(sql), "{sql}");
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "DELETE FROM t",
+            "SELECT 1; SELECT 2",
+            "CREATE TABLE t AS SELECT 1",
+            "UPDATE t SET a = 1",
+            "",
+        ] {
+            assert!(!is_read_only_query(sql), "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_export_tests {
+    use super::{QuackClient, TableExport, TablesFormat};
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    fn setup() -> (std::path::PathBuf, QuackClient) {
+        let dir = std::env::temp_dir().join(format!("duckplus-texport-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("src.duckdb");
+        duckdb::Connection::open(&db).unwrap();
+        let (client, _) = QuackClient::connect_local(&db, false).unwrap();
+        client
+            .run(
+                "CREATE SCHEMA stripe;
+                 CREATE TABLE stripe.refunds (id INTEGER PRIMARY KEY, amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+                   note VARCHAR, created TIMESTAMP, tags VARCHAR[], UNIQUE(note));
+                 INSERT INTO stripe.refunds VALUES (1, 9.99, 'it''s', TIMESTAMP '2024-01-01 10:00', ['a','b']),
+                   (2, 0, NULL, NULL, []);
+                 CREATE TABLE \"Odd Name\" (x INTEGER CHECK (x > 0), y VARCHAR);
+                 INSERT INTO \"Odd Name\" VALUES (1, 'a,b'), (2, NULL);
+                 SELECT 1",
+                1,
+                None,
+            )
+            .unwrap();
+        (dir, client)
+    }
+
+    fn tables(client: &QuackClient, structure: bool, drop: bool, data: bool) -> Vec<TableExport> {
+        let catalog = client.catalog().unwrap();
+        catalog
+            .relations
+            .iter()
+            .filter(|r| !r.is_view)
+            .map(|r| TableExport { rel: r.clone(), structure, drop, data })
+            .collect()
+    }
+
+    fn load(script: &str) -> QuackClient {
+        let path = std::env::temp_dir().join(format!("duckplus-load-{}.duckdb", uuid::Uuid::new_v4()));
+        duckdb::Connection::open(&path).unwrap();
+        let (fresh, _) = QuackClient::connect_local(&path, false).unwrap();
+        fresh.run(&format!("{script}\nSELECT 1"), 1, None).unwrap();
+        fresh
+    }
+
+    fn rows(c: &QuackClient, sql: &str) -> Vec<Vec<Option<String>>> {
+        c.meta_rows(sql).unwrap()
+    }
+
+    #[test]
+    fn sql_script_recreates_tables() {
+        let (dir, client) = setup();
+        let out = dir.join("all.sql");
+        let done = AtomicU64::new(0);
+        let n = client
+            .export_tables(&tables(&client, true, true, true), &TablesFormat::Sql { gzip: false }, &out, &done)
+            .unwrap();
+        assert_eq!((n, done.load(Relaxed)), (4, 2));
+        let script = std::fs::read_to_string(&out).unwrap();
+        assert!(script.contains("CREATE SCHEMA IF NOT EXISTS \"stripe\";"), "{script}");
+        assert!(script.contains("DROP TABLE IF EXISTS \"stripe\".\"refunds\";"), "{script}");
+        assert!(!script.contains("src."), "no database names: {script}");
+
+        let fresh = load(&script);
+        let q = "SELECT count(*), sum(amount)::VARCHAR, max(note), max(len(tags)) FROM stripe.refunds";
+        assert_eq!(rows(&fresh, q), rows(&client, q));
+        let q = "SELECT count(*), string_agg(y, '|') FROM \"Odd Name\"";
+        assert_eq!(rows(&fresh, q), rows(&client, q));
+        // Keys, defaults and checks came along.
+        let ddl = |c: &QuackClient| rows(c, "SELECT sql FROM duckdb_tables() ORDER BY table_name");
+        assert_eq!(ddl(&fresh), ddl(&client));
+        // DROP makes the script re-runnable.
+        fresh.run(&format!("{script}\nSELECT 1"), 1, None).unwrap();
+        assert_eq!(rows(&fresh, "SELECT count(*) FROM stripe.refunds")[0][0].as_deref(), Some("2"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn data_only_structure_only_and_gzip() {
+        let (dir, client) = setup();
+        let done = AtomicU64::new(0);
+        let data = dir.join("data.sql");
+        client.export_tables(&tables(&client, false, false, true), &TablesFormat::Sql { gzip: false }, &data, &done).unwrap();
+        let script = std::fs::read_to_string(&data).unwrap();
+        assert!(!script.contains("CREATE") && script.contains("INSERT INTO"), "{script}");
+
+        let ddl = dir.join("ddl.sql.gz");
+        client.export_tables(&tables(&client, true, false, false), &TablesFormat::Sql { gzip: true }, &ddl, &done).unwrap();
+        let mut script = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&ddl).unwrap()).read_to_string(&mut script).unwrap();
+        assert!(script.contains("CREATE TABLE stripe.refunds") && !script.contains("INSERT"), "{script}");
+        let fresh = load(&script);
+        assert_eq!(rows(&fresh, "SELECT count(*) FROM stripe.refunds")[0][0].as_deref(), Some("0"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn csv_files_per_table() {
+        let (dir, client) = setup();
+        let folder = dir.join("csv");
+        std::fs::create_dir_all(&folder).unwrap();
+        let done = AtomicU64::new(0);
+        let format = TablesFormat::Csv { header: true, delimiter: ';', null_as_empty: false, gzip: false };
+        let n = client.export_tables(&tables(&client, false, false, true), &format, &folder, &done).unwrap();
+        assert_eq!(n, 4);
+        let odd = std::fs::read_to_string(folder.join("main.Odd Name.csv")).unwrap();
+        assert_eq!(odd, "x;y\n1;a,b\n2;NULL\n");
+        assert!(folder.join("stripe.refunds.csv").exists());
+
+        // One table to one file, no header, NULL as empty, gzipped.
+        let one = dir.join("odd.csv.gz");
+        let odd_only: Vec<TableExport> =
+            tables(&client, false, false, true).into_iter().filter(|t| t.rel.name == "Odd Name").collect();
+        let format = TablesFormat::Csv { header: false, delimiter: ',', null_as_empty: true, gzip: true };
+        client.export_tables(&odd_only, &format, &one, &done).unwrap();
+        let mut csv = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&one).unwrap()).read_to_string(&mut csv).unwrap();
+        assert_eq!(csv, "1,\"a,b\"\n2,\n");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

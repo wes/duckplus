@@ -11,7 +11,7 @@ categories = ["development-tools", "gui"]
 
 [dependencies]
 gpui-kit = { version = "0.6", features = ["tree-sitter-sql"] }
-duckdb = { version = "1.10505", features = ["bundled"] }
+duckdb = { version = "1.10505", features = ["bundled", "vtab-arrow"] }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +25,7 @@ lsp-types = "0.97"
 ureq = "3"
 semver = "1"
 sha2 = "0.10"
+flate2 = "1"
 
 [profile.release]
 lto = "thin"
