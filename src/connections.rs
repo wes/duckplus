@@ -1207,7 +1207,13 @@ impl Render for ConnectionsView {
                         .font_semibold()
                         .text_color(theme.muted_foreground)
                         .child(crate::workspace::logo(14.))
-                        .child("DuckPlus"),
+                        .child("DuckPlus")
+                        .child(
+                            div()
+                                .font_normal()
+                                .opacity(0.7)
+                                .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                        ),
                 ),
             )
             .child(
