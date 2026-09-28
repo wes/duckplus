@@ -7,6 +7,7 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Selectable as _, Sizable as _, StyledExt as _, TitleBar, h_flex, v_flex,
@@ -17,6 +18,7 @@ use gpui_kit::*;
 use crate::quack::TlsMode;
 use crate::store::{Folder, Profile, ProfileKind, expand_tilde, tildify};
 use crate::theme::{TAG_COLORS, tag_color};
+use crate::update::{self, UpdateState, Updater};
 use crate::{AppState, close_connections, connect_profile, open_workspace};
 
 const ENDPOINT_PLACEHOLDER: &str = "quack:localhost  ·  db.example.com:9494";
@@ -82,6 +84,7 @@ impl ConnectionsView {
                 cx.notify();
             }),
         );
+        subs.push(cx.observe_global::<Updater>(|_, cx| cx.notify()));
 
         endpoint.update(cx, |s, cx| s.focus(window, cx));
 
@@ -553,6 +556,7 @@ impl ConnectionsView {
                     })
                     .child(list),
             )
+            .children(self.render_update(cx))
             .child(
                 h_flex()
                     .px_3()
@@ -565,6 +569,119 @@ impl ConnectionsView {
                     .child(Icon::new(IconName::Lock).xsmall())
                     .child("Tokens are kept in your system keychain"),
             )
+    }
+
+    /// "A new version is available" and the update's progress, above the footer.
+    fn render_update(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme().clone();
+        let state = cx.global::<Updater>().state.clone();
+        let current = update::current();
+        let card = |icon: IconName, color: Hsla, title: String| {
+            v_flex()
+                .mx_2()
+                .mb_2()
+                .p_2p5()
+                .gap_2()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .text_xs()
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child(Icon::new(icon).xsmall().text_color(color))
+                        .child(title),
+                )
+        };
+        let muted = |text: String| div().text_color(theme.muted_foreground).child(text);
+        let notes = |version: &semver::Version| {
+            let url = format!("{}/tag/v{version}", update::RELEASES);
+            Button::new("update-notes")
+                .ghost()
+                .xsmall()
+                .icon(IconName::ExternalLink)
+                .label("What's new")
+                .on_click(move |_, _, cx| cx.open_url(&url))
+        };
+        let el = match state {
+            UpdateState::Idle => return None,
+            UpdateState::Checking => card(
+                IconName::RefreshCw,
+                theme.muted_foreground,
+                "Checking for updates…".into(),
+            ),
+            UpdateState::UpToDate => card(
+                IconName::CircleCheck,
+                theme.success,
+                format!("DuckPlus {current} is up to date"),
+            ),
+            UpdateState::Available(version) => {
+                let install = version.clone();
+                card(
+                    IconName::Download,
+                    theme.primary,
+                    format!("DuckPlus {version} is available"),
+                )
+                .child(muted(format!("You have {current}. Updating restarts DuckPlus.")))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("update-install")
+                                .small()
+                                .icon(IconName::Download)
+                                .label("Update")
+                                .on_click(move |_, _, cx| update::install(install.clone(), cx)),
+                        )
+                        .child(notes(&version)),
+                )
+            }
+            UpdateState::Installing { version, .. } => {
+                let progress = state_progress(cx);
+                card(
+                    IconName::Download,
+                    theme.primary,
+                    format!("Updating to {version}…"),
+                )
+                .child(
+                    Progress::new("update-progress")
+                        .xsmall()
+                        .loading(progress.is_none_or(|p| p <= 0.))
+                        .value(progress.unwrap_or(0.) * 100.),
+                )
+                .child(muted(match progress {
+                    Some(p) if p >= 1. => "Verifying and installing…".into(),
+                    Some(p) if p > 0. => format!("Downloading… {:.0}%", p * 100.),
+                    _ => "Starting download…".into(),
+                }))
+            }
+            UpdateState::Message(msg) => card(IconName::Info, theme.muted_foreground, "Almost done".into())
+                .child(muted(msg)),
+            UpdateState::Failed(msg) => card(IconName::CircleX, theme.danger, "Update problem".into())
+                .child(muted(msg))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("update-retry")
+                                .small()
+                                .label("Try again")
+                                .on_click(|_, _, cx| update::check_now(cx)),
+                        )
+                        .child(
+                            Button::new("update-download")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::ExternalLink)
+                                .label("Download")
+                                .on_click(|_, _, cx| cx.open_url(&format!("{}/latest", update::RELEASES))),
+                        ),
+                ),
+        };
+        Some(el.into_any_element())
     }
 
     fn folder_row(
@@ -1072,7 +1189,11 @@ impl Focusable for ConnectionsView {
 }
 
 impl Render for ConnectionsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep the download's progress bar moving.
+        if state_progress(cx).is_some() {
+            window.request_animation_frame();
+        }
         let theme = cx.theme();
         v_flex()
             .size_full()
@@ -1123,5 +1244,64 @@ impl Render for DraggedProfile {
             .text_color(theme.popover_foreground)
             .child(div().size(px(8.)).rounded_full().bg(tag_color(self.color)))
             .child(self.name.clone())
+    }
+}
+
+fn state_progress(cx: &App) -> Option<f32> {
+    cx.global::<Updater>().state.progress()
+}
+
+/// The update card in a headless connections window.
+#[cfg(test)]
+mod update_ui_tests {
+    use std::time::Duration;
+
+    use gpui_kit::component::Root;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{AppContext as _, BorrowAppContext as _, TestAppContext, px, size};
+
+    use super::ConnectionsView;
+    use crate::AppState;
+    use crate::store::Store;
+    use crate::update::{UpdateState, Updater};
+
+    #[gpui_kit::test]
+    async fn shows_available_update(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+            cx.set_global(AppState {
+                store: Store::default(),
+                connections_window: None,
+                settings_window: None,
+                launch_error: None,
+            });
+            cx.set_global(Updater::default());
+        });
+        let window = cx
+            .open_window(size(px(760.), px(520.)), |window, cx| {
+                let view = cx.new(|cx| ConnectionsView::new(window, cx));
+                Root::new(view, window, cx)
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("update-install").is_none(), "nothing to show yet");
+        })
+        .unwrap();
+        cx.update(|cx| {
+            cx.update_global::<Updater, _>(|u, _| {
+                u.state = UpdateState::Available(semver::Version::new(9, 9, 9))
+            })
+        });
+        cx.wait_for(window, Duration::from_secs(1), |window, _| {
+            window.try_find("update-install").is_some()
+        })
+        .await;
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find("update-install").visible());
+            assert!(window.find("update-notes").visible());
+        })
+        .unwrap();
     }
 }

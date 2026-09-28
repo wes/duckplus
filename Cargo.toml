@@ -1,6 +1,6 @@
 [package]
 name = "duckplus"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A lightning-fast native IDE for DuckDB over the Quack protocol"
 license = "MIT"
@@ -22,6 +22,9 @@ futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sqlformat = "0.5.0"
 lsp-types = "0.97"
+ureq = "3"
+semver = "1"
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"

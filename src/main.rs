@@ -8,6 +8,7 @@ mod settings;
 mod simple_query;
 mod store;
 mod theme;
+mod update;
 mod workspace;
 
 use gpui_kit::component::{Root, TitleBar};
@@ -23,6 +24,7 @@ gpui_kit::actions!(
     [
         Quit,
         About,
+        CheckForUpdates,
         OpenSettings,
         OpenConnections,
         CloseWindow,
@@ -83,6 +85,8 @@ gpui_kit::assets::icon_assets!(
         Maximize2,
         Info,
         Monitor,
+        Download,
+        ExternalLink,
         Upload,
         FileSpreadsheet,
         X
@@ -208,6 +212,7 @@ fn set_menus(cx: &mut App) {
             name: "DuckPlus".into(),
             items: vec![
                 MenuItem::action("About DuckPlus", About),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),
@@ -493,6 +498,7 @@ fn main() {
             launch_error: None,
         });
         theme::apply(appearance, None, cx);
+        update::init(cx);
 
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
@@ -538,6 +544,10 @@ fn main() {
         cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
         cx.on_action(|_: &OpenConnections, cx| open_connections(cx));
         cx.on_action(|_: &About, cx| open_connections(cx));
+        cx.on_action(|_: &CheckForUpdates, cx| {
+            update::check_now(cx);
+            open_connections(cx);
+        });
         cx.on_action(|_: &CloseWindow, cx| {
             if let Some(handle) = cx.active_window() {
                 let _ = handle.update(cx, |_, window, _| window.remove_window());

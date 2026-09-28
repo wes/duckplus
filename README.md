@@ -10,6 +10,8 @@ Built in Rust on [GPUI](https://gpui-kit.com) (the GPU-accelerated UI framework 
 
 **[Download DuckPlus for Mac](https://github.com/wes/duckplus/releases/latest/download/DuckPlus.dmg)** (always the latest release), open it, and drag DuckPlus into Applications. Older versions are on the [Releases](https://github.com/wes/duckplus/releases) page. It's a universal app (Apple Silicon and Intel), signed and notarized by Apple, and needs macOS 12 or later.
 
+DuckPlus checks for new versions on launch and every few hours (or via **DuckPlus → Check for Updates…**). When one is out, the connections window offers an **Update** button: it downloads the release, verifies its checksum and that it's notarized and signed by the DuckPlus team, swaps it in, and relaunches.
+
 ## Features
 
 - **Paste and connect.** Paste a Quack endpoint and token, press ↵, and the workspace opens. Connections can be saved with a color tag (Local, Dev, Staging, Production…).
@@ -151,4 +153,5 @@ src/workspace/import.rs  CSV import: drop/pick, naming dialog, progress
 src/complete.rs     schema-aware SQL autocomplete
 src/results.rs      result grid delegate (lazy cell formatting)
 src/settings.rs     settings window
+src/update.rs       update checks and self-install from GitHub releases
 ```
